@@ -82,4 +82,3 @@ Then add the site's URL pattern to host_permissions and the content_scripts matc
 Notes
 This is an independent tool and isn't affiliated with the Debrid Media Manager project.
 Site markup (especially IMDb's) changes periodically; if checkboxes stop appearing on a site, the CSS selectors in site-adapters.js likely need a small update.
-
