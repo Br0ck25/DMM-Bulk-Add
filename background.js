@@ -5,42 +5,25 @@ const DEFAULT_SETTINGS = {
   throttleMs: 350,
   openInBackground: true,
   sequentialSingleTab: true,
-  autoCloseAfterClick: false
+  autoCloseAfterClick: false,
+  syncIntervalHours: 24,
+  retryUncached: true,
+  includeSpecials: false,
+  librarySweepIntervalDays: 30
 };
 
-const SEQUENTIAL_STEP_FALLBACK_MS = 20000; // in case a tab never reports back
+const SEQUENTIAL_STEP_FALLBACK_MS = 20000;
+const SOURCE_SCAN_TIMEOUT_MS = 50000; // content-side cap is 45s; give it a margin
+const SEASON_NAV_TIMEOUT_MS = 12000;
+const LIBRARY_SWEEP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes safety cap
 
-// Sequential single-tab batches are tracked by their worker tab id (rather
-// than one global variable) so a manual "Add to DMM" click on a list page
-// and a link-tracking import/re-check can each run their own worker tab
-// without stepping on each other.
-const activeBatches = new Map(); // workerTabId -> batch
+const SYNC_ALARM_NAME = "dmm-source-sync";
+const LIBRARY_SWEEP_ALARM_NAME = "dmm-library-sweep";
 
-const SUPPORTED_HOST_SUFFIXES = [
-  "imdb.com",
-  "letterboxd.com",
-  "mdblist.com",
-  "trakt.tv",
-  "themoviedb.org",
-  "thetvdb.com"
-];
+let activeBatch = null; // sequential-mode batch (single shared tab)
+const multiTabItemMap = new Map(); // tabId -> item, for multi-tab mode tracking
 
-const LINK_CHECK_ALARM = "dmmLinkCheck";
-const LINK_CHECK_PERIOD_MINUTES = 24 * 60;
-
-const SCAN_LOAD_TIMEOUT_MS = 25000;
-const SCAN_SETTLE_MS = 3000;
-const SCAN_RETRY_COUNT = 3;
-const SCAN_RETRY_DELAY_MS = 1500;
-
-// Scanning scrolls the tab repeatedly, re-checking the item count after each
-// scroll, and keeps going until the count stops growing (rather than a fixed
-// number of scrolls) — long lazy-loaded lists (large MDBList/IMDb lists,
-// etc.) can need many more than a couple of nudges to reach the end.
-const SCAN_MAX_SCROLL_ROUNDS = 40;
-const SCAN_SCROLL_ROUND_DELAY_MS = 900;
-const SCAN_STABLE_ROUNDS_TO_STOP = 3; // consecutive no-growth rounds before we call it done
-const SCAN_MAX_TOTAL_SCROLL_MS = 45000; // hard cap so a huge/broken list can't hang a scan forever
+// ---------- settings / storage helpers ----------
 
 async function getSettings() {
   const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
@@ -52,526 +35,599 @@ async function bumpTotalSentCount(n) {
   await chrome.storage.local.set({ totalSent: totalSent + n });
 }
 
+async function recordProcessed(item, found) {
+  if (!item) return;
+  const key = dmmItemKey(item);
+  const { processedIds = {} } = await chrome.storage.local.get("processedIds");
+  processedIds[key] = {
+    status: found ? "added" : "attempted",
+    lastTriedAt: Date.now(),
+    title: item.title || key,
+    id: item.id || null
+  };
+  await chrome.storage.local.set({ processedIds });
+}
+
+async function filterUnprocessed(items, retryUncached) {
+  const { processedIds = {} } = await chrome.storage.local.get("processedIds");
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = dmmItemKey(it);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const rec = processedIds[key];
+    if (rec) {
+      if (rec.status === "added") continue;
+      if (rec.status === "attempted" && !retryUncached) continue;
+    }
+    out.push(it);
+  }
+  return out;
+}
+
+// ---------- progress notifications ----------
+
 function notifyOrigin(originTabId, done, total) {
   if (originTabId == null) return;
   chrome.tabs.sendMessage(originTabId, { type: "DMM_BULK_PROGRESS", done, total }).catch(() => {});
 }
 
-function clearBatchTimeout(batch) {
-  if (batch && batch.timeoutHandle) {
-    clearTimeout(batch.timeoutHandle);
-    batch.timeoutHandle = null;
+// ---------- sequential (single shared tab) batch ----------
+
+function clearBatchTimeout() {
+  if (activeBatch && activeBatch.timeoutHandle) {
+    clearTimeout(activeBatch.timeoutHandle);
+    activeBatch.timeoutHandle = null;
   }
 }
 
-function finishBatch(tabId) {
-  const batch = activeBatches.get(tabId);
-  if (!batch) return;
-  clearBatchTimeout(batch);
-  activeBatches.delete(tabId);
-  if (batch.resolve) batch.resolve();
-}
+async function advanceSequentialBatch(found) {
+  if (!activeBatch) return;
+  clearBatchTimeout();
 
-async function advanceSequentialBatch(tabId) {
-  const batch = activeBatches.get(tabId);
-  if (!batch) return;
-  clearBatchTimeout(batch);
-  batch.index++;
-  notifyOrigin(batch.originTabId, batch.index, batch.total);
+  const finishedItem = activeBatch.items[activeBatch.index];
+  await recordProcessed(finishedItem, !!found);
 
-  if (batch.index >= batch.total) {
-    await bumpTotalSentCount(batch.total);
-    finishBatch(tabId);
+  activeBatch.index++;
+  notifyOrigin(activeBatch.originTabId, activeBatch.index, activeBatch.total);
+
+  if (activeBatch.index >= activeBatch.total) {
+    activeBatch = null;
     return;
   }
 
-  await new Promise((r) => setTimeout(r, batch.settings.throttleMs));
-  if (!activeBatches.has(tabId)) return; // could have been cancelled during the delay
+  const settings = await getSettings();
+  await new Promise((r) => setTimeout(r, settings.throttleMs));
+  if (!activeBatch) return;
 
-  const nextUrl = batch.urls[batch.index];
+  const nextItem = activeBatch.items[activeBatch.index];
   try {
-    await chrome.tabs.update(tabId, { url: nextUrl });
+    await chrome.tabs.update(activeBatch.workerTabId, { url: nextItem.url });
   } catch (e) {
     console.warn("DMM Bulk Add: failed to navigate worker tab, stopping batch", e);
-    finishBatch(tabId);
+    activeBatch = null;
     return;
   }
-  armStepFallback(tabId);
+  armStepFallback();
 }
 
-function armStepFallback(tabId) {
-  const batch = activeBatches.get(tabId);
-  if (!batch) return;
-  batch.timeoutHandle = setTimeout(() => {
+function armStepFallback() {
+  if (!activeBatch) return;
+  activeBatch.timeoutHandle = setTimeout(() => {
     console.warn("DMM Bulk Add: no response from tab in time, advancing anyway");
-    advanceSequentialBatch(tabId);
+    advanceSequentialBatch(false);
   }, SEQUENTIAL_STEP_FALLBACK_MS);
 }
 
-function startSequentialBatch(urls, originTabId, settings) {
+async function startSequentialBatch(items, originTabId, settings) {
+  activeBatch = {
+    items, // [{url, id, title, year, type}]
+    total: items.length,
+    index: 0,
+    workerTabId: null,
+    originTabId,
+    timeoutHandle: null
+  };
+  notifyOrigin(originTabId, 0, items.length);
+
+  const tab = await chrome.tabs.create({
+    url: items[0].url,
+    active: !settings.openInBackground
+  });
+  if (!activeBatch) return;
+  activeBatch.workerTabId = tab.id;
+  armStepFallback();
+}
+
+// Waits for a sequential batch to fully finish — used by scheduled/automated
+// flows (source sync, show expansion) that need to know when it's safe to
+// move on to the next thing, rather than firing and forgetting.
+function runQueueAndWait(items, originTabId, settings) {
   return new Promise(async (resolve) => {
-    notifyOrigin(originTabId, 0, urls.length);
-    let tab;
-    try {
-      tab = await chrome.tabs.create({ url: urls[0], active: !settings.openInBackground });
-    } catch (e) {
-      console.warn("DMM Bulk Add: failed to open first tab in batch", e);
-      resolve();
-      return;
-    }
-    const batch = {
-      urls,
-      total: urls.length,
-      index: 0,
-      originTabId,
-      settings,
-      timeoutHandle: null,
-      resolve
-    };
-    activeBatches.set(tab.id, batch);
-    armStepFallback(tab.id);
+    await startSequentialBatch(items, originTabId, settings);
+    const check = setInterval(() => {
+      if (!activeBatch) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 500);
   });
 }
 
-async function startMultiTabBatch(urls, originTabId, settings) {
-  const total = urls.length;
+// ---------- multi-tab batch ----------
+
+async function startMultiTabBatch(items, originTabId, settings) {
+  const total = items.length;
   let done = 0;
-  for (let i = 0; i < urls.length; i++) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     try {
-      await chrome.tabs.create({
-        url: urls[i],
+      const tab = await chrome.tabs.create({
+        url: item.url,
         active: i === 0 ? true : !settings.openInBackground
       });
+      multiTabItemMap.set(tab.id, item);
     } catch (e) {
-      console.warn("DMM Bulk Add: failed to open", urls[i], e);
+      console.warn("DMM Bulk Add: failed to open", item.url, e);
     }
     done++;
     notifyOrigin(originTabId, done, total);
-    if (i < urls.length - 1) {
+    if (i < items.length - 1) {
       await new Promise((r) => setTimeout(r, settings.throttleMs));
     }
   }
   await bumpTotalSentCount(total);
 }
 
-// Opens each item's DMM page and lets the existing single/multi-tab batch
-// logic (with auto-pick, if enabled) work through them. Used both for the
-// user-facing "Add to DMM" button and for link-tracking import/re-checks.
-async function addItemsToDmm(items, settings) {
-  const urls = items.map(dmmBuildUrl);
-  if (!urls.length) return;
-  if (settings.sequentialSingleTab) {
-    await startSequentialBatch(urls, null, settings);
-  } else {
-    await startMultiTabBatch(urls, null, settings);
-  }
-}
-
 chrome.tabs.onRemoved.addListener((tabId) => {
-  finishBatch(tabId);
+  if (activeBatch && activeBatch.workerTabId === tabId) {
+    clearBatchTimeout();
+    activeBatch = null;
+  }
+  multiTabItemMap.delete(tabId);
 });
 
-// ---------- Link tracking: scanning a list page for its current items ----------
-
-function isSupportedListUrl(urlStr) {
-  try {
-    const host = new URL(urlStr).hostname.toLowerCase();
-    return SUPPORTED_HOST_SUFFIXES.some((s) => host === s || host.endsWith("." + s));
-  } catch (e) {
-    return false;
+async function processQueue(items, originTabId, settings) {
+  if (!items.length) return;
+  if (settings.sequentialSingleTab) {
+    await runQueueAndWait(items, originTabId, settings);
+  } else {
+    await startMultiTabBatch(items, originTabId, settings);
   }
 }
 
-function waitForTabComplete(tabId, timeoutMs) {
-  return new Promise((resolve) => {
-    let done = false;
+// ---------- scanning an external list page (auto-tracked links) ----------
+
+function scanSourceUrlViaTab(url) {
+  return new Promise(async (resolve) => {
+    let settled = false;
+    let tabId;
+
+    const cleanup = () => {
+      chrome.runtime.onMessage.removeListener(listener);
+      clearTimeout(timer);
+      if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+    };
+
+    const listener = (msg, sender) => {
+      if (
+        !settled &&
+        msg &&
+        msg.type === "DMM_SOURCE_SCAN_RESULT" &&
+        sender.tab &&
+        sender.tab.id === tabId
+      ) {
+        settled = true;
+        cleanup();
+        resolve(msg.items || []);
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
     const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(false);
-    }, timeoutMs);
-    function listener(updatedTabId, info) {
-      if (updatedTabId === tabId && info.status === "complete") {
-        if (done) return;
-        done = true;
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve([]);
+      }
+    }, SOURCE_SCAN_TIMEOUT_MS);
+
+    try {
+      const tab = await chrome.tabs.create({ url, active: false });
+      tabId = tab.id;
+      // Give the content script a moment to load before asking it to scan.
+      setTimeout(() => {
+        chrome.tabs.sendMessage(tabId, { type: "DMM_SOURCE_SCAN_RUN" }).catch(() => {});
+      }, 1200);
+    } catch (e) {
+      console.warn("DMM Bulk Add: failed to open source URL", url, e);
+      if (!settled) {
+        settled = true;
         clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve(true);
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve([]);
       }
     }
-    chrome.tabs.onUpdated.addListener(listener);
   });
 }
 
-// Scrolls the scanned tab one "round": the window itself, plus any element
-// on the page that's its own scroll container (some sites put the list in
-// an inner div with overflow-y:auto rather than scrolling the whole page).
-async function scrollTabOnce(tabId) {
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      window.scrollTo(0, document.body.scrollHeight);
-      document.querySelectorAll("*").forEach((el) => {
-        if (el.scrollHeight - el.clientHeight > 200) {
-          el.scrollTop = el.scrollHeight;
-        }
+// ---------- discovering a show's seasons ----------
+
+function discoverShowSeasons(imdbId) {
+  return new Promise(async (resolve) => {
+    let settled = false;
+    let tabId;
+
+    const cleanup = () => {
+      chrome.runtime.onMessage.removeListener(listener);
+      clearTimeout(timer);
+      if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+    };
+
+    const listener = (msg, sender) => {
+      if (
+        !settled &&
+        msg &&
+        msg.type === "DMM_SEASON_NAV" &&
+        msg.imdbId === imdbId &&
+        sender.tab &&
+        sender.tab.id === tabId
+      ) {
+        settled = true;
+        cleanup();
+        resolve(msg.seasons || []);
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve([]);
+      }
+    }, SEASON_NAV_TIMEOUT_MS);
+
+    try {
+      const tab = await chrome.tabs.create({
+        url: `https://debridmediamanager.com/show/${imdbId}?dmmSeasonScan=1`,
+        active: false
       });
+      tabId = tab.id;
+    } catch (e) {
+      console.warn("DMM Bulk Add: failed to open show page for season discovery", imdbId, e);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve([]);
+      }
     }
   });
 }
 
-// Asks content.js what it's found so far. content.js accumulates every item
-// it's ever seen on the page (state.known), not just what's currently in the
-// DOM, so this naturally grows monotonically as more of the list loads in —
-// safe to call repeatedly across scroll rounds.
-async function requestKnownItems(tabId) {
-  for (let attempt = 0; attempt < SCAN_RETRY_COUNT; attempt++) {
-    try {
-      const resp = await chrome.tabs.sendMessage(tabId, { type: "DMM_REQUEST_KNOWN_ITEMS" });
-      if (resp && Array.isArray(resp.items)) return resp.items;
-    } catch (e) {
-      /* content script not injected/ready yet — retry after a short wait */
-    }
-    await new Promise((r) => setTimeout(r, SCAN_RETRY_DELAY_MS));
+async function expandShowIntoSeasonItems(showItem, includeSpecials) {
+  const seasons = await discoverShowSeasons(showItem.id);
+  if (!seasons.length) {
+    // Couldn't discover seasons (page failed to load, no seasons found,
+    // etc.) — don't silently drop the show, fall back to its plain URL.
+    return [showItem];
   }
-  return [];
+  return seasons
+    .filter((s) => includeSpecials || s !== 0)
+    .map((s) => dmmSeasonItem(showItem, s));
 }
 
-async function scanLinkForItems(url) {
-  const tab = await chrome.tabs.create({ url, active: false });
-  const tabId = tab.id;
-  try {
-    await waitForTabComplete(tabId, SCAN_LOAD_TIMEOUT_MS);
-    await new Promise((r) => setTimeout(r, SCAN_SETTLE_MS));
+// ---------- sources (auto-tracked links) ----------
 
-    let items = await requestKnownItems(tabId);
-    let stableRounds = 0;
-    const scrollStart = Date.now();
-
-    for (let round = 0; round < SCAN_MAX_SCROLL_ROUNDS; round++) {
-      if (Date.now() - scrollStart > SCAN_MAX_TOTAL_SCROLL_MS) break;
-
-      try {
-        await scrollTabOnce(tabId);
-      } catch (e) {
-        break; // page doesn't allow scripting (rare) — nothing more we can do
-      }
-      await new Promise((r) => setTimeout(r, SCAN_SCROLL_ROUND_DELAY_MS));
-
-      const next = await requestKnownItems(tabId);
-      if (next.length > items.length) {
-        items = next;
-        stableRounds = 0;
-      } else {
-        stableRounds++;
-        if (stableRounds >= SCAN_STABLE_ROUNDS_TO_STOP) break;
-      }
-    }
-
-    return items;
-  } finally {
-    chrome.tabs.remove(tabId).catch(() => {});
-  }
+async function getSources() {
+  const { sources = [] } = await chrome.storage.local.get("sources");
+  return sources;
 }
 
-// Re-scans a tracked link, updates its stored state, and returns any items
-// not already in its known set. Does NOT send anything to DMM itself —
-// callers decide whether/when to do that.
-async function checkSingleLink(linkId) {
-  const { watchedLinks = [] } = await chrome.storage.local.get("watchedLinks");
-  const idx = watchedLinks.findIndex((l) => l.id === linkId);
-  if (idx === -1) return { ok: false, error: "That link isn't tracked anymore." };
-  const link = watchedLinks[idx];
+async function saveSources(sources) {
+  await chrome.storage.local.set({ sources });
+}
 
-  let items;
+async function addSource(url) {
+  const sources = await getSources();
+  const id = `src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  let host = "";
   try {
-    items = await scanLinkForItems(link.url);
+    host = new URL(url).hostname;
   } catch (e) {
-    return { ok: false, error: "Couldn't load that page to check it." };
+    /* leave host blank if URL is malformed; UI already validates roughly */
   }
-
-  if (!items.length) {
-    // Don't wipe out a previously-good knownKeys list just because a scan
-    // came back empty (page might have failed to load fully this time).
-    watchedLinks[idx] = { ...link, lastCheckedAt: Date.now() };
-    await chrome.storage.local.set({ watchedLinks });
-    return { ok: true, newItems: [], itemCount: link.itemCount || 0 };
-  }
-
-  const knownSet = new Set(link.knownKeys || []);
-  const newItems = items.filter((it) => !knownSet.has(dmmItemKey(it)));
-  const mergedKeys = Array.from(new Set([...(link.knownKeys || []), ...items.map(dmmItemKey)]));
-
-  watchedLinks[idx] = {
-    ...link,
-    lastCheckedAt: Date.now(),
-    itemCount: items.length,
-    knownKeys: mergedKeys
-  };
-  await chrome.storage.local.set({ watchedLinks });
-
-  return { ok: true, newItems, itemCount: items.length };
+  sources.push({
+    id,
+    url,
+    label: host,
+    enabled: true,
+    lastRunAt: null,
+    lastFoundCount: null,
+    lastAddedCount: null
+  });
+  await saveSources(sources);
+  runSourceSync(id).catch((e) => console.warn("DMM Bulk Add: initial source sync failed", e));
+  return id;
 }
 
-async function checkAllLinks() {
-  const { watchedLinks = [] } = await chrome.storage.local.get("watchedLinks");
+async function removeSource(id) {
+  const sources = await getSources();
+  await saveSources(sources.filter((s) => s.id !== id));
+}
+
+async function setSourceEnabled(id, enabled) {
+  const sources = await getSources();
+  const src = sources.find((s) => s.id === id);
+  if (src) src.enabled = enabled;
+  await saveSources(sources);
+}
+
+async function runSourceSync(specificSourceId) {
+  const sources = await getSources();
   const settings = await getSettings();
-  for (const link of watchedLinks) {
-    try {
-      const result = await checkSingleLink(link.id);
-      if (result.ok && result.newItems.length) {
-        await addItemsToDmm(result.newItems, settings);
+  let changed = false;
+
+  for (const source of sources) {
+    if (specificSourceId && source.id !== specificSourceId) continue;
+    if (!specificSourceId && !source.enabled) continue;
+
+    const rawItems = await scanSourceUrlViaTab(source.url);
+    const passedTopLevel = await filterUnprocessed(rawItems, settings.retryUncached);
+
+    const groups = [];
+    for (const it of passedTopLevel) {
+      if (it.type === "show" && it.id) {
+        const seasonItems = await expandShowIntoSeasonItems(it, settings.includeSpecials);
+        const filteredSeasonItems = await filterUnprocessed(seasonItems, settings.retryUncached);
+        groups.push({
+          topLevelItem: it,
+          queueItems: filteredSeasonItems,
+          allSeasonKeys: seasonItems.map(dmmItemKey)
+        });
+      } else {
+        groups.push({ topLevelItem: it, queueItems: [it], allSeasonKeys: null });
       }
-    } catch (e) {
-      console.warn("DMM Bulk Add: auto-check failed for", link.url, e);
     }
+
+    const queueItems = groups
+      .flatMap((g) => g.queueItems)
+      .map((it) => ({ ...it, url: dmmBuildUrl(it) }));
+
+    await processQueue(queueItems, null, settings);
+
+    const { processedIds = {} } = await chrome.storage.local.get("processedIds");
+    for (const g of groups) {
+      if (g.allSeasonKeys) {
+        const allAdded = g.allSeasonKeys.every(
+          (k) => processedIds[k] && processedIds[k].status === "added"
+        );
+        if (allAdded) await recordProcessed(g.topLevelItem, true);
+      }
+    }
+
+    source.lastRunAt = Date.now();
+    source.lastFoundCount = rawItems.length;
+    source.lastAddedCount = queueItems.length;
+    changed = true;
   }
+
+  if (changed) await saveSources(sources);
 }
 
-// Make sure the recurring alarm exists whenever the service worker (re)starts —
-// covers first install, browser restart, and the service worker being woken
-// back up after being suspended.
-chrome.alarms.get(LINK_CHECK_ALARM, (existing) => {
-  if (!existing) {
-    chrome.alarms.create(LINK_CHECK_ALARM, { delayInMinutes: 1, periodInMinutes: LINK_CHECK_PERIOD_MINUTES });
-  }
-});
+// ---------- library-wide reinsert sweep ----------
+
+function runLibrarySweepTab(settings) {
+  return new Promise(async (resolve) => {
+    let settled = false;
+    let tabId;
+
+    const cleanup = () => {
+      chrome.runtime.onMessage.removeListener(listener);
+      clearTimeout(timer);
+    };
+
+    const listener = (msg, sender) => {
+      if (
+        !settled &&
+        msg &&
+        msg.type === "DMM_LIBRARY_SWEEP_DONE" &&
+        sender.tab &&
+        sender.tab.id === tabId
+      ) {
+        settled = true;
+        cleanup();
+        chrome.tabs.remove(tabId).catch(() => {});
+        resolve(msg.count || 0);
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+        resolve(0);
+      }
+    }, LIBRARY_SWEEP_TIMEOUT_MS);
+
+    try {
+      const tab = await chrome.tabs.create({
+        url: "https://debridmediamanager.com/library",
+        active: !settings.openInBackground
+      });
+      tabId = tab.id;
+      setTimeout(() => {
+        chrome.tabs.sendMessage(tabId, { type: "DMM_LIBRARY_SWEEP_RUN" }).catch(() => {});
+      }, 2500);
+    } catch (e) {
+      console.warn("DMM Bulk Add: failed to open library page", e);
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve(0);
+      }
+    }
+  });
+}
+
+async function runLibrarySweepAndRecord() {
+  const settings = await getSettings();
+  const count = await runLibrarySweepTab(settings);
+  await chrome.storage.local.set({
+    librarySweep: { lastRunAt: Date.now(), lastCount: count }
+  });
+}
+
+// ---------- alarms ----------
+
+async function ensureAlarms() {
+  const settings = await getSettings();
+  chrome.alarms.create(SYNC_ALARM_NAME, {
+    periodInMinutes: Math.max(60, settings.syncIntervalHours * 60),
+    delayInMinutes: 1
+  });
+  chrome.alarms.create(LIBRARY_SWEEP_ALARM_NAME, {
+    periodInMinutes: Math.max(60, settings.librarySweepIntervalDays * 24 * 60),
+    delayInMinutes: 2
+  });
+}
+
+chrome.runtime.onInstalled.addListener(ensureAlarms);
+chrome.runtime.onStartup.addListener(ensureAlarms);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === LINK_CHECK_ALARM) {
-    checkAllLinks().catch((e) => console.warn("DMM Bulk Add: checkAllLinks failed", e));
+  if (alarm.name === SYNC_ALARM_NAME) {
+    runSourceSync().catch((e) => console.warn("DMM Bulk Add: scheduled source sync failed", e));
+  } else if (alarm.name === LIBRARY_SWEEP_ALARM_NAME) {
+    runLibrarySweepAndRecord().catch((e) =>
+      console.warn("DMM Bulk Add: scheduled library sweep failed", e)
+    );
   }
 });
 
-// ---------- TV show: scan a show page for its season list ----------
+// ---------- message handling ----------
 
-const SHOW_PAGE_RE = /^https:\/\/debridmediamanager\.com\/show\/([^/]+)(?:\/(\d+))?\/?(?:[?#].*)?$/;
-const SEASON_HREF_RE = /\/show\/[^/]+\/(\d+)\/?$/;
-
-const SEASON_SCAN_SETTLE_MS = 2000;
-
-function buildShowBaseUrl(urlStr) {
-  const m = (urlStr || "").trim().match(SHOW_PAGE_RE);
-  if (!m) return null;
-  return `https://debridmediamanager.com/show/${m[1]}`;
-}
-
-// Reads the season nav bar (the row of "Season 1" / "Season 2" / ... links
-// at the top of a show page) to get the exact season list DMM knows about,
-// rather than guessing/hardcoding a season count. Tries the show's base URL
-// first; if that page doesn't render the nav for some reason, falls back to
-// the season-1 URL, since the same nav also appears there.
-async function scanSeasonHrefs(showUrl) {
-  const base = buildShowBaseUrl(showUrl);
-  if (!base) {
-    return { ok: false, error: "That doesn't look like a debridmediamanager.com show URL." };
-  }
-
-  const candidates = [base, `${base}/1`];
-  for (const url of candidates) {
-    let tab;
-    try {
-      tab = await chrome.tabs.create({ url, active: false });
-    } catch (e) {
-      continue;
-    }
-    try {
-      await waitForTabComplete(tab.id, SCAN_LOAD_TIMEOUT_MS);
-      await new Promise((r) => setTimeout(r, SEASON_SCAN_SETTLE_MS));
-
-      let hrefs = [];
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            const nav = document.querySelector('[data-testid="media-header-season-nav"]');
-            if (!nav) return [];
-            return Array.from(nav.querySelectorAll("a[href]")).map((a) => a.getAttribute("href"));
-          }
-        });
-        hrefs = (results && results[0] && results[0].result) || [];
-      } catch (e) {
-        hrefs = [];
-      }
-
-      if (hrefs.length) {
-        return { ok: true, base, hrefs };
-      }
-    } finally {
-      chrome.tabs.remove(tab.id).catch(() => {});
-    }
-  }
-
-  return {
-    ok: false,
-    error: "Couldn't find a season list on that page — make sure it's a DMM show page."
-  };
-}
-
-function seasonUrlsFromHrefs(hrefs, base, includeSpecials) {
-  const numbers = [];
-  for (const href of hrefs) {
-    const m = (href || "").match(SEASON_HREF_RE);
-    if (!m) continue;
-    const n = parseInt(m[1], 10);
-    if (!includeSpecials && n === 0) continue; // "Specials" is season 0
-    numbers.push(n);
-  }
-  const uniqueSorted = Array.from(new Set(numbers)).sort((a, b) => a - b);
-  return uniqueSorted.map((n) => `${base}/${n}`);
-}
-
-// ---------- Message handling ----------
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg) return false;
-
-  if (msg.type === "DMM_CLOSE_TAB") {
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg && msg.type === "DMM_CLOSE_TAB") {
     const tabId = sender.tab && sender.tab.id;
-    // Never close a tab mid-batch — sequential mode reuses it for the
-    // remaining titles.
-    if (tabId != null && !activeBatches.has(tabId)) {
+    if (tabId != null && !(activeBatch && activeBatch.workerTabId === tabId)) {
       chrome.tabs.remove(tabId).catch(() => {});
     }
     return false;
   }
 
-  if (msg.type === "DMM_AUTOPICK_RESULT") {
+  if (msg && msg.type === "DMM_AUTOPICK_RESULT") {
     const tabId = sender.tab && sender.tab.id;
-    if (tabId != null && activeBatches.has(tabId)) {
-      advanceSequentialBatch(tabId);
+    if (activeBatch && activeBatch.workerTabId === tabId) {
+      advanceSequentialBatch(!!msg.found);
+    } else if (multiTabItemMap.has(tabId)) {
+      const item = multiTabItemMap.get(tabId);
+      multiTabItemMap.delete(tabId);
+      recordProcessed(item, !!msg.found);
     }
     return false;
   }
 
-  if (msg.type === "DMM_BULK_OPEN") {
+  if (msg && msg.type === "DMM_BULK_OPEN") {
     (async () => {
       const settings = await getSettings();
       const originTabId = sender.tab && sender.tab.id;
-      const urls = Array.isArray(msg.urls) ? msg.urls : [];
-      if (!urls.length) return;
+      const rawItems = Array.isArray(msg.items) ? msg.items : [];
+      if (!rawItems.length) return;
 
-      if (settings.sequentialSingleTab) {
-        await startSequentialBatch(urls, originTabId, settings);
-      } else {
-        await startMultiTabBatch(urls, originTabId, settings);
+      const topLevelItems = msg.forceIncludeAll
+        ? rawItems
+        : await filterUnprocessed(rawItems, settings.retryUncached);
+
+      // Shows need to be expanded into per-season items (same as
+      // runSourceSync/DMM_ADD_SHOW_ALL_SEASONS) — otherwise a selected show
+      // just resolves to its bare /show/<imdbId> page, which DMM redirects
+      // to season 1 only, silently dropping every other season.
+      const groups = [];
+      for (const it of topLevelItems) {
+        if (it.type === "show" && it.id) {
+          const seasonItems = await expandShowIntoSeasonItems(it, settings.includeSpecials);
+          const filteredSeasonItems = msg.forceIncludeAll
+            ? seasonItems
+            : await filterUnprocessed(seasonItems, settings.retryUncached);
+          groups.push({
+            topLevelItem: it,
+            queueItems: filteredSeasonItems,
+            allSeasonKeys: seasonItems.map(dmmItemKey)
+          });
+        } else {
+          groups.push({ topLevelItem: it, queueItems: [it], allSeasonKeys: null });
+        }
+      }
+
+      const queueItems = groups
+        .flatMap((g) => g.queueItems)
+        .map((it) => ({ ...it, url: dmmBuildUrl(it) }));
+
+      if (!queueItems.length) {
+        notifyOrigin(originTabId, 0, 0);
+        return;
+      }
+      await processQueue(queueItems, originTabId, settings);
+
+      const { processedIds = {} } = await chrome.storage.local.get("processedIds");
+      for (const g of groups) {
+        if (g.allSeasonKeys) {
+          const allAdded = g.allSeasonKeys.every(
+            (k) => processedIds[k] && processedIds[k].status === "added"
+          );
+          if (allAdded) await recordProcessed(g.topLevelItem, true);
+        }
       }
     })();
     return false;
   }
 
-  if (msg.type === "DMM_ADD_LINK") {
-    (async () => {
-      try {
-        const url = (msg.url || "").trim();
-        if (!url || !isSupportedListUrl(url)) {
-          sendResponse({
-            ok: false,
-            error: "Unsupported or invalid URL. Use an IMDb, Letterboxd, MDBList, Trakt, TMDB, or TheTVDB list/watchlist link."
-          });
-          return;
-        }
-        const { watchedLinks = [] } = await chrome.storage.local.get("watchedLinks");
-        if (watchedLinks.some((l) => l.url === url)) {
-          sendResponse({ ok: false, error: "That link is already tracked." });
-          return;
-        }
-
-        let items;
-        try {
-          items = await scanLinkForItems(url);
-        } catch (e) {
-          sendResponse({ ok: false, error: "Couldn't load or scan that page." });
-          return;
-        }
-        if (!items.length) {
-          sendResponse({
-            ok: false,
-            error: "No titles found on that page — double check it's a list/watchlist URL, and that you're logged in if it's private."
-          });
-          return;
-        }
-
-        const link = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          url,
-          addedAt: Date.now(),
-          lastCheckedAt: Date.now(),
-          itemCount: items.length,
-          knownKeys: items.map(dmmItemKey)
-        };
-        watchedLinks.push(link);
-        await chrome.storage.local.set({ watchedLinks });
-        sendResponse({ ok: true, count: items.length });
-
-        const settings = await getSettings();
-        addItemsToDmm(items, settings).catch((e) =>
-          console.warn("DMM Bulk Add: link import batch failed", e)
-        );
-      } catch (e) {
-        console.warn("DMM Bulk Add: DMM_ADD_LINK failed", e);
-        sendResponse({ ok: false, error: "Something went wrong." });
-      }
-    })();
-    return true;
+  if (msg && msg.type === "DMM_SYNC_NOW") {
+    runSourceSync(msg.sourceId).catch((e) => console.warn("DMM Bulk Add: manual sync failed", e));
+    return false;
   }
 
-  if (msg.type === "DMM_ADD_SHOW_SEASONS") {
-    (async () => {
-      try {
-        const mode = msg.mode === "episodes" ? "episodes" : "whole";
-        const includeSpecials = !!msg.includeSpecials;
-
-        const scan = await scanSeasonHrefs(msg.url);
-        if (!scan.ok) {
-          sendResponse({ ok: false, error: scan.error });
-          return;
-        }
-
-        const urls = seasonUrlsFromHrefs(scan.hrefs, scan.base, includeSpecials);
-        if (!urls.length) {
-          sendResponse({ ok: false, error: "No seasons found for that show." });
-          return;
-        }
-
-        // dmm-autopick.js reads this to know which of the two season-page
-        // action buttons to click; it's set right before the batch starts
-        // so it applies for every season page this batch visits.
-        await chrome.storage.sync.set({ seasonPickMode: mode });
-
-        sendResponse({ ok: true, count: urls.length });
-
-        const settings = await getSettings();
-        if (settings.sequentialSingleTab) {
-          await startSequentialBatch(urls, null, settings);
-        } else {
-          await startMultiTabBatch(urls, null, settings);
-        }
-      } catch (e) {
-        console.warn("DMM Bulk Add: DMM_ADD_SHOW_SEASONS failed", e);
-        sendResponse({ ok: false, error: "Something went wrong." });
-      }
-    })();
-    return true;
+  if (msg && msg.type === "DMM_ADD_SOURCE") {
+    addSource(msg.url).catch((e) => console.warn("DMM Bulk Add: add source failed", e));
+    return false;
   }
 
-  if (msg.type === "DMM_CHECK_LINK_NOW") {
+  if (msg && msg.type === "DMM_REMOVE_SOURCE") {
+    removeSource(msg.id).catch(() => {});
+    return false;
+  }
+
+  if (msg && msg.type === "DMM_TOGGLE_SOURCE") {
+    setSourceEnabled(msg.id, msg.enabled).catch(() => {});
+    return false;
+  }
+
+  if (msg && msg.type === "DMM_ADD_SHOW_ALL_SEASONS") {
     (async () => {
-      const result = await checkSingleLink(msg.id);
-      sendResponse(
-        result.ok
-          ? { ok: true, newCount: result.newItems.length, itemCount: result.itemCount }
-          : { ok: false, error: result.error }
-      );
-      if (result.ok && result.newItems.length) {
-        const settings = await getSettings();
-        addItemsToDmm(result.newItems, settings).catch((e) =>
-          console.warn("DMM Bulk Add: manual check-now add failed", e)
-        );
-      }
-    })();
-    return true;
+      const settings = await getSettings();
+      const showItem = { id: msg.imdbId, title: msg.title || msg.imdbId, year: "", type: "show" };
+      const seasonItems = await expandShowIntoSeasonItems(showItem, msg.includeSpecials);
+      const filtered = await filterUnprocessed(seasonItems, settings.retryUncached);
+      const queueItems = filtered.map((it) => ({ ...it, url: dmmBuildUrl(it) }));
+      await processQueue(queueItems, null, settings);
+    })().catch((e) => console.warn("DMM Bulk Add: add-all-seasons failed", e));
+    return false;
+  }
+
+  if (msg && msg.type === "DMM_LIBRARY_SWEEP_NOW") {
+    runLibrarySweepAndRecord().catch((e) => console.warn("DMM Bulk Add: library sweep failed", e));
+    return false;
+  }
+
+  if (msg && msg.type === "DMM_RESCHEDULE_ALARM") {
+    ensureAlarms();
+    return false;
   }
 
   return false;

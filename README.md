@@ -138,38 +138,58 @@ sent to DMM).
 
 ## TV show — all seasons
 
-In the popup, under **TV show — all seasons**, you can paste a DMM show URL
-(`debridmediamanager.com/show/<imdbId>`, or a specific season URL like
-`.../show/<imdbId>/3` — either works) and click **Add all seasons**. This:
+In the popup, under **TV show — all seasons**, paste a DMM show URL
+(`debridmediamanager.com/show/<imdbId>`) or just the bare IMDb ID, and click
+**Add all seasons**. This reads the show's season-nav bar to find every
+season it has, then sends them all through the same whole-season →
+every-episode logic described below — as a one-off, without waiting for a
+tracked link's next scheduled check.
 
-1. Briefly opens that page in a background tab and reads its season nav bar
-   (the row of "Season 1" / "Season 2" / ... links) to get the exact list of
-   seasons DMM has for that show — so it works whether the show has 1 season
-   or 20, without you having to tell it how many.
-2. Sends every season's URL through the same "Add to DMM" flow used
-   elsewhere (one shared tab or many, per your settings above).
-3. On each season's page, `dmm-autopick.js` clicks whichever fixed action
-   button you chose in the dropdown — **Instant RD (Whole Season)** or
-   **Instant RD (Every Episode)** — rather than the generic "first Instant
-   RD result" logic used on movie/search pages. Season pages don't stream in
-   a growing results list the way movie pages do, so this just waits for
-   that button to appear and clicks it (still bounded by the same "settle
-   time before picking" / max-wait handling described above).
+"Include Specials (season 0)" (in Settings) applies here too — off by
+default.
 
-"Include Specials (season 0)" is off by default — turn it on if you also
-want the show's Specials season included in the batch.
+## Season handling for tracked TV shows
+
+Auto-tracked links (and the all-seasons tool below) don't stop at season 1.
+For any show, the extension first opens its base show page to read the
+season-nav bar (however many seasons it has, including Season 0 if "Include
+Specials" is on), then queues **every season individually**. Each season
+page:
+
+1. Tries **"Instant RD (Whole Season)"** first.
+2. Falls back to **"Instant RD (Every Episode)"** if the whole-season option
+   isn't there.
+3. Leaves the page alone for manual review if neither shows up in time.
+
+Each season is tracked and skipped/retried independently — so if season 3
+isn't cached yet but seasons 1, 2, and 4 are, only season 3 gets retried on
+the next check, instead of the whole show being marked done or redone as a
+unit.
 
 **Things worth knowing:**
 
 - This turns off if "Auto-click Instant RD" is off — with it off, each
   season page is just opened and left for you to pick manually.
-- If a season's page doesn't have a cached whole-season/every-episode result
-  yet, DMM may not render that button at all (or it may take a moment); the
-  script waits up to the same "settle time" / max-wait as elsewhere before
-  giving up and moving to the next season, leaving that one page for manual
-  review.
-- Like auto-tracked links, scanning the season list briefly opens and closes
-  a background tab — there's no way around loading the real page for this.
+- Discovering a show's seasons briefly opens and closes a background tab,
+  same as everything else here — there's no way around loading the real
+  page for this.
+
+## Library refresh (reinsert everything)
+
+DMM's `/library` page has a per-item "reinsert" icon (a green refresh arrow)
+— distinct from the single "Refresh library" button in the top bar — that
+re-checks/re-adds that one item. **Library refresh** in the popup automates
+clicking that icon on *every* item in your library:
+
+- **Refresh DMM library now** opens `/library` in a tab, scrolls through the
+  whole list (handling however many items you have, not just what first
+  renders), clicks every per-item reinsert icon it finds, then closes the
+  tab and records how many it hit.
+- It also runs automatically on a schedule — **Re-check every (days)**,
+  default **30** — via the same alarm mechanism as auto-tracked links, so it
+  keeps happening as long as the browser is open, popup or not.
+- This is a full sweep: every movie and every show in your library gets its
+  reinsert icon clicked, not just recently-added ones.
 
 ## Settings
 
@@ -179,6 +199,8 @@ Click the extension icon to adjust:
   opening one per title
 - **Delay between tabs** — pause between titles/navigations; raise this if
   DMM's server or your connection needs a beat between searches
+- **Re-check every (hours)** — how often tracked links are rescanned for new
+  titles; the default is 24 hours
 - **Open new tabs in background** — keeps your current tab focused
 - **Auto-click "Instant RD"** — turn off to review every result yourself
 - **Settle time before picking (ms)** — how long the results list must stay
@@ -187,6 +209,13 @@ Click the extension icon to adjust:
 - **Auto-close tab after adding** — only applies in multi-tab mode (the
   shared tab in sequential mode is never closed mid-batch, since it needs to
   be reused)
+- **Retry titles not yet cached** — when on (default), a title/season that
+  wasn't cached last time gets tried again on future checks instead of being
+  skipped forever; titles that *were* successfully added are always skipped
+- **Include Specials (season 0)** — off by default; include a show's
+  Specials season when expanding into all seasons
+- **Re-check every (days)** — how often the full library reinsert sweep
+  runs automatically; default 30 days
 
 ## Extending to more sites
 

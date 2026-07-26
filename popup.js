@@ -4,193 +4,206 @@ const DEFAULT_SETTINGS = {
   autoClickInstant: true,
   autoCloseAfterClick: false,
   sequentialSingleTab: true,
-  settleMs: 1000
+  settleMs: 1000,
+  syncIntervalHours: 24,
+  retryUncached: true,
+  includeSpecials: false,
+  librarySweepIntervalDays: 30
 };
 
-async function load() {
-  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  document.getElementById("throttleMs").value = settings.throttleMs;
-  document.getElementById("openInBackground").checked = settings.openInBackground;
-  document.getElementById("autoClickInstant").checked = settings.autoClickInstant;
-  document.getElementById("autoCloseAfterClick").checked = settings.autoCloseAfterClick;
-  document.getElementById("sequentialSingleTab").checked = settings.sequentialSingleTab;
-  document.getElementById("settleMs").value = settings.settleMs;
-
-  const { totalSent = 0 } = await chrome.storage.local.get("totalSent");
-  document.getElementById("totalSent").textContent = totalSent;
-}
-
-function save() {
-  const throttleMs = Math.max(100, parseInt(document.getElementById("throttleMs").value, 10) || 350);
-  const settleMs = Math.max(300, parseInt(document.getElementById("settleMs").value, 10) || 1000);
-  const openInBackground = document.getElementById("openInBackground").checked;
-  const autoClickInstant = document.getElementById("autoClickInstant").checked;
-  const autoCloseAfterClick = document.getElementById("autoCloseAfterClick").checked;
-  const sequentialSingleTab = document.getElementById("sequentialSingleTab").checked;
-  chrome.storage.sync.set({
-    throttleMs,
-    openInBackground,
-    autoClickInstant,
-    autoCloseAfterClick,
-    sequentialSingleTab,
-    settleMs
-  });
-}
-
-[
+const SETTINGS_FIELDS = [
   "throttleMs",
   "openInBackground",
   "autoClickInstant",
   "autoCloseAfterClick",
   "sequentialSingleTab",
-  "settleMs"
-].forEach((id) => document.getElementById(id).addEventListener("change", save));
+  "settleMs",
+  "syncIntervalHours",
+  "retryUncached",
+  "includeSpecials",
+  "librarySweepIntervalDays"
+];
 
-load();
-
-// ---------- Auto-tracked links ----------
-
-function relativeTime(ts) {
-  if (!ts) return "never checked";
-  const mins = Math.round((Date.now() - ts) / 60000);
-  if (mins < 1) return "checked just now";
-  if (mins < 60) return `checked ${mins}m ago`;
+function fmtTime(ts) {
+  if (!ts) return "never";
+  const diffMs = Date.now() - ts;
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
   const hours = Math.round(mins / 60);
-  if (hours < 24) return `checked ${hours}h ago`;
-  const days = Math.round(hours / 24);
-  return `checked ${days}d ago`;
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }
 
-function escapeHtml(s) {
-  return (s || "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  })[c]);
+async function loadSettings() {
+  const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+  document.getElementById("throttleMs").value = settings.throttleMs;
+  document.getElementById("settleMs").value = settings.settleMs;
+  document.getElementById("syncIntervalHours").value = settings.syncIntervalHours;
+  document.getElementById("librarySweepIntervalDays").value = settings.librarySweepIntervalDays;
+  document.getElementById("openInBackground").checked = settings.openInBackground;
+  document.getElementById("autoClickInstant").checked = settings.autoClickInstant;
+  document.getElementById("autoCloseAfterClick").checked = settings.autoCloseAfterClick;
+  document.getElementById("sequentialSingleTab").checked = settings.sequentialSingleTab;
+  document.getElementById("retryUncached").checked = settings.retryUncached;
+  document.getElementById("includeSpecials").checked = settings.includeSpecials;
 }
 
-async function renderLinks() {
-  const { watchedLinks = [] } = await chrome.storage.local.get("watchedLinks");
-  const list = document.getElementById("linksList");
-  list.innerHTML = "";
+function saveSettings() {
+  const throttleMs = Math.max(100, parseInt(document.getElementById("throttleMs").value, 10) || 350);
+  const settleMs = Math.max(300, parseInt(document.getElementById("settleMs").value, 10) || 1000);
+  const syncIntervalHours = Math.max(1, parseInt(document.getElementById("syncIntervalHours").value, 10) || 24);
+  const librarySweepIntervalDays = Math.max(
+    1,
+    parseInt(document.getElementById("librarySweepIntervalDays").value, 10) || 30
+  );
+  const settings = {
+    throttleMs,
+    settleMs,
+    syncIntervalHours,
+    librarySweepIntervalDays,
+    openInBackground: document.getElementById("openInBackground").checked,
+    autoClickInstant: document.getElementById("autoClickInstant").checked,
+    autoCloseAfterClick: document.getElementById("autoCloseAfterClick").checked,
+    sequentialSingleTab: document.getElementById("sequentialSingleTab").checked,
+    retryUncached: document.getElementById("retryUncached").checked,
+    includeSpecials: document.getElementById("includeSpecials").checked
+  };
+  chrome.storage.sync.set(settings);
+  chrome.runtime.sendMessage({ type: "DMM_RESCHEDULE_ALARM" }).catch(() => {});
+}
 
-  if (!watchedLinks.length) {
-    const li = document.createElement("li");
-    li.className = "empty-hint";
-    li.textContent = "No links tracked yet.";
-    list.appendChild(li);
+SETTINGS_FIELDS.forEach((id) => document.getElementById(id).addEventListener("change", saveSettings));
+
+// ---------- sources ----------
+
+async function renderSources() {
+  const { sources = [] } = await chrome.storage.local.get("sources");
+  const container = document.getElementById("sourcesList");
+  container.innerHTML = "";
+
+  if (!sources.length) {
+    container.innerHTML = '<div class="empty">No tracked links yet.</div>';
     return;
   }
 
-  watchedLinks
-    .slice()
-    .sort((a, b) => b.addedAt - a.addedAt)
-    .forEach((link) => {
-      const li = document.createElement("li");
-      li.className = "link-card";
-      li.innerHTML = `
-        <div class="url">${escapeHtml(link.url)}</div>
-        <div class="meta">${link.itemCount || 0} title${link.itemCount === 1 ? "" : "s"} &middot; ${relativeTime(link.lastCheckedAt)}</div>
-        <div class="actions">
-          <button data-action="check" data-id="${link.id}">Check now</button>
-          <button data-action="remove" data-id="${link.id}">Remove</button>
-        </div>
-      `;
-      list.appendChild(li);
+  sources.forEach((source) => {
+    const div = document.createElement("div");
+    div.className = "source-item";
+    const found = source.lastFoundCount == null ? "—" : source.lastFoundCount;
+    const added = source.lastAddedCount == null ? "—" : source.lastAddedCount;
+    div.innerHTML = `
+      <div class="label">${source.label || source.url}</div>
+      <div class="meta">${source.url}</div>
+      <div class="meta">Last checked: ${fmtTime(source.lastRunAt)} — found ${found}, sent ${added} new</div>
+      <div class="actions">
+        <label style="display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" class="source-enabled" ${source.enabled ? "checked" : ""} />
+          Enabled
+        </label>
+        <button class="btn-secondary source-check-now">Check now</button>
+        <button class="btn-danger source-remove">Remove</button>
+      </div>
+    `;
+    div.querySelector(".source-enabled").addEventListener("change", (e) => {
+      chrome.runtime.sendMessage({ type: "DMM_TOGGLE_SOURCE", id: source.id, enabled: e.target.checked });
     });
+    div.querySelector(".source-check-now").addEventListener("click", (e) => {
+      e.target.textContent = "Checking…";
+      e.target.disabled = true;
+      chrome.runtime.sendMessage({ type: "DMM_SYNC_NOW", sourceId: source.id });
+      setTimeout(() => renderSources(), 3000);
+    });
+    div.querySelector(".source-remove").addEventListener("click", () => {
+      chrome.runtime.sendMessage({ type: "DMM_REMOVE_SOURCE", id: source.id });
+      setTimeout(renderSources, 200);
+    });
+    container.appendChild(div);
+  });
 }
 
-document.getElementById("linksList").addEventListener("click", async (e) => {
-  const btn = e.target.closest("button[data-action]");
-  if (!btn) return;
-  const { action, id } = btn.dataset;
-  const statusEl = document.getElementById("linkStatus");
-
-  if (action === "remove") {
-    const { watchedLinks = [] } = await chrome.storage.local.get("watchedLinks");
-    await chrome.storage.local.set({ watchedLinks: watchedLinks.filter((l) => l.id !== id) });
-    renderLinks();
-    return;
-  }
-
-  if (action === "check") {
-    btn.disabled = true;
-    statusEl.textContent = "Checking for new titles…";
-    chrome.runtime.sendMessage({ type: "DMM_CHECK_LINK_NOW", id }, (resp) => {
-      btn.disabled = false;
-      if (chrome.runtime.lastError) {
-        statusEl.textContent = "Check failed — try again.";
-        return;
-      }
-      if (!resp || !resp.ok) {
-        statusEl.textContent = (resp && resp.error) || "Check failed.";
-        return;
-      }
-      statusEl.textContent = resp.newCount
-        ? `Found ${resp.newCount} new title${resp.newCount === 1 ? "" : "s"} — sending to DMM.`
-        : "No new titles found.";
-      renderLinks();
-    });
-  }
-});
-
-document.getElementById("addLinkBtn").addEventListener("click", () => {
-  const input = document.getElementById("linkUrlInput");
-  const addBtn = document.getElementById("addLinkBtn");
-  const statusEl = document.getElementById("linkStatus");
+document.getElementById("addSourceBtn").addEventListener("click", () => {
+  const input = document.getElementById("sourceUrlInput");
   const url = input.value.trim();
   if (!url) return;
-
-  addBtn.disabled = true;
-  statusEl.textContent = "Importing… this briefly opens a background tab to scan the list.";
-
-  chrome.runtime.sendMessage({ type: "DMM_ADD_LINK", url }, (resp) => {
-    addBtn.disabled = false;
-    if (chrome.runtime.lastError) {
-      statusEl.textContent = "Something went wrong — try again.";
-      return;
-    }
-    if (!resp || !resp.ok) {
-      statusEl.textContent = (resp && resp.error) || "Couldn't add that link.";
-      return;
-    }
-    input.value = "";
-    statusEl.textContent = `Imported ${resp.count} title${resp.count === 1 ? "" : "s"} — sending to DMM now.`;
-    renderLinks();
-  });
+  try {
+    new URL(url);
+  } catch (e) {
+    alert("That doesn't look like a valid URL.");
+    return;
+  }
+  chrome.runtime.sendMessage({ type: "DMM_ADD_SOURCE", url });
+  input.value = "";
+  setTimeout(renderSources, 300);
 });
 
-renderLinks();
+// ---------- TV show — all seasons ----------
 
-// ---------- TV show: all seasons ----------
+function extractImdbId(text) {
+  const m = (text || "").match(/tt\d{6,9}/);
+  return m ? m[0] : null;
+}
 
 document.getElementById("addShowBtn").addEventListener("click", () => {
   const input = document.getElementById("showUrlInput");
-  const modeSel = document.getElementById("showSeasonMode");
-  const includeSpecials = document.getElementById("showIncludeSpecials").checked;
-  const btn = document.getElementById("addShowBtn");
-  const statusEl = document.getElementById("showStatus");
-  const url = input.value.trim();
-  if (!url) return;
-
-  btn.disabled = true;
-  statusEl.textContent = "Finding seasons… this briefly opens a background tab.";
-
-  chrome.runtime.sendMessage(
-    { type: "DMM_ADD_SHOW_SEASONS", url, mode: modeSel.value, includeSpecials },
-    (resp) => {
-      btn.disabled = false;
-      if (chrome.runtime.lastError) {
-        statusEl.textContent = "Something went wrong — try again.";
-        return;
-      }
-      if (!resp || !resp.ok) {
-        statusEl.textContent = (resp && resp.error) || "Couldn't add that show.";
-        return;
-      }
-      statusEl.textContent = `Found ${resp.count} season${resp.count === 1 ? "" : "s"} — sending to DMM now.`;
-    }
-  );
+  const status = document.getElementById("showStatus");
+  const imdbId = extractImdbId(input.value);
+  if (!imdbId) {
+    status.textContent = "Couldn't find an IMDb ID (tt1234567) in that.";
+    return;
+  }
+  status.textContent = "Discovering seasons and sending…";
+  chrome.runtime.sendMessage({
+    type: "DMM_ADD_SHOW_ALL_SEASONS",
+    imdbId,
+    includeSpecials: document.getElementById("includeSpecials").checked
+  });
+  input.value = "";
+  setTimeout(() => {
+    status.textContent = "Sent — check the shared/worker tab for progress.";
+  }, 1500);
 });
+
+// ---------- library sweep ----------
+
+async function renderLibrarySweepStatus() {
+  const { librarySweep } = await chrome.storage.local.get("librarySweep");
+  const el = document.getElementById("librarySweepStatus");
+  if (!librarySweep || !librarySweep.lastRunAt) {
+    el.textContent = "Never run yet.";
+    el.classList.add("empty");
+    return;
+  }
+  el.classList.remove("empty");
+  el.textContent = `Last run ${fmtTime(librarySweep.lastRunAt)} — reinserted ${librarySweep.lastCount} item(s).`;
+}
+
+document.getElementById("librarySweepBtn").addEventListener("click", (e) => {
+  e.target.disabled = true;
+  e.target.textContent = "Sweeping… (this can take a while)";
+  chrome.runtime.sendMessage({ type: "DMM_LIBRARY_SWEEP_NOW" });
+  setTimeout(() => {
+    e.target.disabled = false;
+    e.target.textContent = "Refresh DMM library now";
+    renderLibrarySweepStatus();
+  }, 8000);
+});
+
+// ---------- stats ----------
+
+async function renderStats() {
+  const { totalSent = 0 } = await chrome.storage.local.get("totalSent");
+  document.getElementById("totalSent").textContent = totalSent;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.sources) renderSources();
+  if (changes.totalSent) renderStats();
+  if (changes.librarySweep) renderLibrarySweepStatus();
+});
+
+loadSettings();
+renderSources();
+renderStats();
+renderLibrarySweepStatus();

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DMM Bulk Add",
-  "version": "1.2.1",
-  "description": "Adds select-all + bulk add to your DMM library from IMDb, Letterboxd, MDBList, Trakt, TMDB and TheTVDB lists, plus auto-tracked links that re-check for new titles every 24 hours.",
+  "version": "1.3.2",
+  "description": "Adds select-all + bulk add to your DMM library from IMDb, Letterboxd, MDBList, Trakt, TMDB and TheTVDB lists, auto-tracked links, all-seasons TV handling, and a scheduled full-library reinsert sweep.",
   "permissions": ["storage", "tabs", "alarms", "scripting"],
   "host_permissions": [
     "https://www.imdb.com/*",
@@ -51,6 +51,11 @@
       "matches": ["https://debridmediamanager.com/*"],
       "js": ["dmm-autopick.js"],
       "css": ["dmm-autopick.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://debridmediamanager.com/library*"],
+      "js": ["dmm-library-refresh.js"],
       "run_at": "document_idle"
     }
   ]

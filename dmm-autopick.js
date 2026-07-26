@@ -1,39 +1,27 @@
 // dmm-autopick.js
-// Runs on debridmediamanager.com. DMM labels already-cached torrents with an
-// "Instant RD" button (vs "DL with RD" for ones that still need downloading).
+// Runs on every debridmediamanager.com page. Two jobs:
 //
-// Two modes, chosen by URL shape:
-// - Movie/search pages (runGeneric, below): waits for the results list to
-//   settle (not just "first appear" — DMM streams results in over a second
-//   or two and re-sorts as better matches come in), then clicks the first
-//   "Instant RD" it finds.
-// - Show season pages, /show/<imdbId>/<seasonNumber> (runSeasonPick, below):
-//   clicks the fixed "Instant RD (Whole Season)" or "Instant RD (Every
-//   Episode)" button instead — see SEASON_PAGE_RE.
+// 1. On a movie/search page: wait for the results list to settle, then click
+//    the first "Instant RD" result.
+// 2. On a specific season page (/show/<imdbId>/<n>): prefer clicking
+//    "Instant RD (Whole Season)"; if that button isn't there, fall back to
+//    "Instant RD (Every Episode)".
+//
+// It also reports the season-nav bar (Season 1 / Season 2 / ... links) back
+// to the background script when present, so the "auto-tracked links" and
+// "TV show — all seasons" features can discover every season a show has
+// without hardcoding a season count.
 
 const DEFAULT_SETTINGS = {
   autoClickInstant: true,
   autoCloseAfterClick: false,
   closeDelayMs: 1200,
   maxWaitMs: 15000,
-  settleMs: 1000,
-  // Only used on show season pages (see runSeasonPick below): which of the
-  // two fixed action buttons — "Instant RD (Whole Season)" or
-  // "Instant RD (Every Episode)" — to click. Set by the popup right before
-  // a season batch starts (DMM_ADD_SHOW_SEASONS in background.js).
-  seasonPickMode: "whole"
+  settleMs: 1000
 };
 
 let handled = false;
-
-// Season pages (debridmediamanager.com/show/<imdbId>/<seasonNumber>) don't
-// stream in a growing list of torrent results the way movie/search pages do
-// — they show two fixed action buttons up top ("Instant RD (Whole Season)"
-// and "Instant RD (Every Episode)") plus a results list further down. We
-// only ever want one of those two fixed buttons here, never a result from
-// the list below, so this gets its own matcher instead of reusing
-// findInstantButtons().
-const SEASON_PAGE_RE = /^\/show\/[^/]+\/\d+\/?$/;
+let seasonNavReported = false;
 
 function showToast(text, kind) {
   const existing = document.getElementById("dmm-autopick-toast");
@@ -51,33 +39,36 @@ function isVisible(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
-function findInstantButtons() {
+function matchingButtons(regex) {
   const candidates = Array.from(document.querySelectorAll("button, a, [role='button']"));
   return candidates.filter((el) => {
     const text = (el.textContent || "").trim();
-    return /instant\s*rd/i.test(text) && text.length < 60 && isVisible(el);
+    return regex.test(text) && text.length < 80 && isVisible(el);
   });
 }
 
-function findSeasonActionButton(mode) {
-  const wantText =
-    mode === "episodes" ? "instant rd (every episode)" : "instant rd (whole season)";
-  const candidates = Array.from(document.querySelectorAll("button, a, [role='button']"));
-  return (
-    candidates.find((el) => {
-      if (el.disabled) return false;
-      const text = (el.textContent || "").trim().toLowerCase();
-      return text === wantText && isVisible(el);
-    }) || null
-  );
+function findInstantButtons() {
+  // Movie/search-page cached results are just "Instant RD" — matching the
+  // exact phrase (not "contains") naturally excludes the season-specific
+  // "(Whole Season)" / "(Every Episode)" variants used on show pages.
+  return matchingButtons(/^instant\s*rd$/i);
 }
 
 function findDownloadButtons() {
-  const candidates = Array.from(document.querySelectorAll("button, a, [role='button']"));
-  return candidates.filter((el) => {
-    const text = (el.textContent || "").trim();
-    return /^dl\s*with\s*rd/i.test(text) && isVisible(el);
-  });
+  return matchingButtons(/^dl\s*with\s*rd/i);
+}
+
+function findWholeSeasonButton() {
+  return matchingButtons(/instant\s*rd\s*\(\s*whole\s*season\s*\)/i)[0] || null;
+}
+
+function findEveryEpisodeButton() {
+  return matchingButtons(/instant\s*rd\s*\(\s*every\s*episode\s*\)/i)[0] || null;
+}
+
+function getSeasonPageInfo() {
+  const m = location.pathname.match(/^\/show\/(tt\d+)\/(\d+)$/);
+  return m ? { imdbId: m[1], season: parseInt(m[2], 10) } : null;
 }
 
 async function getSettings() {
@@ -95,48 +86,50 @@ function reportResult(found) {
   chrome.runtime.sendMessage({ type: "DMM_AUTOPICK_RESULT", found }).catch(() => {});
 }
 
-// Season pages don't need the "wait for the list to go quiet" logic that
-// movie/search pages need, since the two action buttons are fixed (not a
-// streamed-in results list) — just poll until the right one shows up and
-// is clickable, then click it. Still bounded by maxWaitMs so a batch can't
-// get stuck forever if a season page fails to load the button at all.
-async function runSeasonPick(settings) {
-  if (!settings.autoClickInstant) {
-    reportResult(false);
+function reportSeasonNavIfPresent() {
+  if (seasonNavReported) return;
+  const m = location.pathname.match(/^\/show\/(tt\d+)(\/\d+)?$/);
+  if (!m) return;
+  const imdbId = m[1];
+  const seasonLinkPattern = new RegExp(`^/show/${imdbId}/(\\d+)$`);
+  const seasons = new Set();
+  document.querySelectorAll("a[href]").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    const mm = href.match(seasonLinkPattern);
+    if (mm) seasons.add(parseInt(mm[1], 10));
+  });
+  if (seasons.size > 0) {
+    seasonNavReported = true;
+    chrome.runtime
+      .sendMessage({
+        type: "DMM_SEASON_NAV",
+        imdbId,
+        seasons: Array.from(seasons).sort((a, b) => a - b)
+      })
+      .catch(() => {});
+  }
+}
+
+async function run() {
+  const settings = await getSettings();
+  const seasonInfo = getSeasonPageInfo();
+  const scanOnly = new URLSearchParams(location.search).has("dmmSeasonScan");
+
+  // Season-nav discovery runs regardless of the auto-click setting — it's
+  // read-only and other features (auto-tracked links, all-seasons tool)
+  // depend on it.
+  const navObserver = new MutationObserver(() => reportSeasonNavIfPresent());
+  navObserver.observe(document.body, { childList: true, subtree: true });
+  reportSeasonNavIfPresent();
+  setTimeout(reportSeasonNavIfPresent, 1500);
+
+  if (scanOnly) {
+    // This tab was opened only to read the season-nav bar (e.g. discovering
+    // how many seasons a show has) — don't also click anything on it.
     return;
   }
 
-  const start = Date.now();
-
-  const evaluate = () => {
-    if (handled) return;
-    const btn = findSeasonActionButton(settings.seasonPickMode);
-
-    if (btn) {
-      handled = true;
-      btn.scrollIntoView({ block: "center", behavior: "instant" });
-      btn.click();
-      showToast(`✓ Auto-added: "${btn.textContent.trim()}"`, "success");
-      if (settings.autoCloseAfterClick) requestTabClose(settings.closeDelayMs);
-      reportResult(true);
-      return;
-    }
-
-    if (Date.now() - start > settings.maxWaitMs) {
-      handled = true;
-      showToast("Couldn't find that season's Instant RD button — pick manually.", "warn");
-      reportResult(false);
-      return;
-    }
-    setTimeout(evaluate, 300);
-  };
-
-  setTimeout(evaluate, 300);
-}
-
-async function runGeneric(settings) {
   if (!settings.autoClickInstant) {
-    // Still tell the queue (if any) to move on immediately — nothing to wait for.
     reportResult(false);
     return;
   }
@@ -154,25 +147,49 @@ async function runGeneric(settings) {
     characterData: true
   });
 
-  const finish = (found, target) => {
+  const finish = (found, target, label) => {
     if (handled) return;
     handled = true;
     observer.disconnect();
     if (found) {
       target.scrollIntoView({ block: "center", behavior: "instant" });
       target.click();
-      showToast(`✓ Auto-added instant result: "${target.textContent.trim()}"`, "success");
+      showToast(`✓ Auto-added: "${label || target.textContent.trim()}"`, "success");
       if (settings.autoCloseAfterClick) requestTabClose(settings.closeDelayMs);
     } else {
-      const anyDownloadButtons = findDownloadButtons();
-      if (anyDownloadButtons.length > 0) {
-        showToast("No Instant RD result found — pick one manually.", "warn");
+      const anyDownloadButtons = seasonInfo ? [] : findDownloadButtons();
+      if (anyDownloadButtons.length > 0 || seasonInfo) {
+        showToast("No Instant RD result found yet — pick one manually.", "warn");
       }
     }
     reportResult(found);
   };
 
-  const evaluate = () => {
+  const evaluateSeasonPage = () => {
+    if (handled) return;
+    const now = Date.now();
+    const quiet = now - lastMutation >= settings.settleMs;
+
+    if (quiet) {
+      const whole = findWholeSeasonButton();
+      if (whole) {
+        finish(true, whole, "Instant RD (Whole Season)");
+        return;
+      }
+      const every = findEveryEpisodeButton();
+      if (every) {
+        finish(true, every, "Instant RD (Every Episode)");
+        return;
+      }
+    }
+    if (now - start > settings.maxWaitMs) {
+      finish(false, null);
+      return;
+    }
+    setTimeout(evaluateSeasonPage, 300);
+  };
+
+  const evaluateMoviePage = () => {
     if (handled) return;
     const now = Date.now();
     const instantButtons = findInstantButtons();
@@ -186,20 +203,10 @@ async function runGeneric(settings) {
       finish(false, null);
       return;
     }
-    setTimeout(evaluate, 300);
+    setTimeout(evaluateMoviePage, 300);
   };
 
-  setTimeout(evaluate, 300);
+  setTimeout(seasonInfo ? evaluateSeasonPage : evaluateMoviePage, 300);
 }
 
-async function main() {
-  const settings = await getSettings();
-  if (SEASON_PAGE_RE.test(location.pathname)) {
-    await runSeasonPick(settings);
-  } else {
-    await runGeneric(settings);
-  }
-}
-
-main();
-
+run();

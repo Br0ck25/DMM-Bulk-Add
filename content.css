@@ -87,3 +87,12 @@
   opacity: 0.8;
   white-space: nowrap;
 }
+
+.dmm-bulk-already-added {
+  opacity: 0.45;
+  filter: grayscale(40%);
+}
+
+.dmm-bulk-already-added .dmm-bulk-checkbox-wrap {
+  opacity: 0.6;
+}

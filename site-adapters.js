@@ -85,14 +85,27 @@ const SITE_ADAPTERS = [
       nodes.forEach((container) => {
         const imdbId = findImdbIdIn(container);
         if (!imdbId) return;
-        if (container.dataset.dmmScanned) return;
-        const anchor = container.querySelector("a[href]");
+
+        // MDBList's own poster link reveals the media type directly —
+        // /show/<slug> for TV, /movie/<slug> for movies — which is far more
+        // reliable than guessing "movie vs show" from nearby text (that's
+        // what caused The Rookie, a show, to be misclassified as a movie).
+        const mdbLink = container.querySelector('a[href*="/show/"], a[href*="/movie/"]');
+        const isShow = !!(mdbLink && /\/show\//.test(mdbLink.getAttribute("href") || ""));
+
         const fullText = textOf(container);
+        const titleYearMatch = fullText.match(/([^()]{2,80}?)\s*\((\d{4})\)/);
+        const anchor = container.querySelector("a[href]");
+        const title = titleYearMatch
+          ? titleYearMatch[1].trim()
+          : (anchor && textOf(anchor)) || imdbId;
+        const year = titleYearMatch ? titleYearMatch[2] : guessYear(fullText);
+
         items.push({
           id: imdbId,
-          title: (anchor && textOf(anchor)) || imdbId,
-          year: guessYear(fullText),
-          type: guessType(fullText),
+          title,
+          year,
+          type: isShow ? "show" : "movie",
           container
         });
       });
