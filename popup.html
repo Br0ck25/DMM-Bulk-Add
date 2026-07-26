@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>DMM Bulk Add</title>
+  <style>
+    body {
+      width: 300px;
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 14px;
+      color: #111827;
+    }
+    h1 {
+      font-size: 15px;
+      margin: 0 0 4px;
+    }
+    p.sub {
+      margin: 0 0 14px;
+      color: #6b7280;
+      font-size: 12px;
+    }
+    label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    input[type="number"] {
+      width: 64px;
+      padding: 4px 6px;
+    }
+    .stat {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid #e5e7eb;
+      color: #374151;
+    }
+    .sites {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .section h2 {
+      font-size: 13px;
+      margin: 0 0 4px;
+    }
+    .add-link-row {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0 4px;
+    }
+    .add-link-row input {
+      flex: 1;
+      min-width: 0;
+      padding: 5px 6px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+    }
+    .add-link-row button,
+    .link-card button {
+      border: 1px solid #d1d5db;
+      background: #fff;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .add-link-row button:hover,
+    .link-card button:hover {
+      background: #f3f4f6;
+    }
+    .add-link-row button:disabled,
+    .link-card button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    #linkStatus {
+      font-size: 12px;
+      color: #6b7280;
+      min-height: 14px;
+      margin-bottom: 4px;
+    }
+    #linksList {
+      list-style: none;
+      padding: 0;
+      margin: 6px 0 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .link-card {
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 6px 8px;
+    }
+    .link-card .url {
+      font-size: 12px;
+      word-break: break-all;
+    }
+    .link-card .meta {
+      font-size: 11px;
+      color: #6b7280;
+      margin-top: 2px;
+    }
+    .link-card .actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .empty-hint {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <h1>DMM Bulk Add</h1>
+  <p class="sub">Select-all checkboxes for list pages, so you can send many titles to Debrid Media Manager at once instead of one by one.</p>
+
+  <label>
+    Use one shared tab (no clutter)
+    <input type="checkbox" id="sequentialSingleTab" />
+  </label>
+
+  <label>
+    Delay between tabs (ms)
+    <input type="number" id="throttleMs" min="100" step="50" />
+  </label>
+
+  <label>
+    Open new tabs in background
+    <input type="checkbox" id="openInBackground" />
+  </label>
+
+  <label>
+    Auto-click "Instant RD"
+    <input type="checkbox" id="autoClickInstant" />
+  </label>
+
+  <label>
+    Settle time before picking (ms)
+    <input type="number" id="settleMs" min="300" step="100" />
+  </label>
+
+  <label>
+    Auto-close tab after adding
+    <input type="checkbox" id="autoCloseAfterClick" />
+  </label>
+
+  <div class="stat">Titles sent so far: <strong id="totalSent">0</strong></div>
+  <div class="sites">
+    "Use one shared tab" reuses a single tab for the whole batch instead of
+    opening one tab per title — same result, no tab-bar clutter.
+  </div>
+  <div class="sites">
+    On each DMM page, if a cached ("Instant RD") result is found it's clicked
+    automatically once the results list stops changing. If nothing is cached,
+    the tab/page is left as-is so you can pick "DL with RD" manually.
+  </div>
+
+  <div class="sites">
+    Works on: IMDb, MDBList, Trakt, TMDB, TheTVDB and Letterboxd list/watchlist pages.
+  </div>
+
+  <div class="section">
+    <h2>TV show — all seasons</h2>
+    <p class="sites" style="margin-top:0;">
+      Paste a DMM show URL (e.g. debridmediamanager.com/show/tt7587890). This
+      finds every season the show has, then opens each one in turn and
+      auto-clicks that season's chosen button below (using the shared-tab /
+      delay settings above).
+    </p>
+    <div class="add-link-row">
+      <input type="text" id="showUrlInput" placeholder="Paste a DMM show URL" />
+    </div>
+    <div class="add-link-row">
+      <select id="showSeasonMode" style="flex:1;padding:5px 6px;border:1px solid #d1d5db;border-radius:4px;">
+        <option value="whole">Instant RD (Whole Season)</option>
+        <option value="episodes">Instant RD (Every Episode)</option>
+      </select>
+    </div>
+    <label>
+      Include Specials (season 0)
+      <input type="checkbox" id="showIncludeSpecials" />
+    </label>
+    <button id="addShowBtn" style="width:100%;padding:6px;">Add all seasons</button>
+    <div id="showStatus" style="font-size:12px;color:#6b7280;min-height:14px;margin-top:6px;"></div>
+  </div>
+
+  <div class="section">
+    <h2>Auto-tracked links</h2>
+    <p class="sites" style="margin-top:0;">
+      Paste a list/watchlist link below. It's imported right away (every title
+      gets sent to DMM using the settings above), then re-checked every 24
+      hours — any titles added to the list since last time get sent too.
+    </p>
+    <div class="add-link-row">
+      <input type="text" id="linkUrlInput" placeholder="Paste a list/watchlist URL" />
+      <button id="addLinkBtn">Add</button>
+    </div>
+    <div id="linkStatus"></div>
+    <ul id="linksList"></ul>
+  </div>
+</body>
+<script src="popup.js"></script>
+</html>

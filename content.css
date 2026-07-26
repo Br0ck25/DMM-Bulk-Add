@@ -1,0 +1,89 @@
+.dmm-bulk-checkbox-wrap {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 999;
+  background: rgba(17, 24, 39, 0.75);
+  border-radius: 6px;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.dmm-bulk-checkbox {
+  width: 18px;
+  height: 18px;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+
+#dmm-bulk-toolbar {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 2147483000;
+  display: none;
+  align-items: center;
+  gap: 10px;
+  background: #111827;
+  color: #f9fafb;
+  padding: 10px 14px;
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#dmm-bulk-toolbar .dmm-bulk-selectall {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+#dmm-bulk-toolbar input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+
+#dmm-bulk-count {
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+#dmm-bulk-toolbar button {
+  border: none;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#dmm-bulk-add-btn {
+  background: #2563eb;
+  color: white;
+}
+
+#dmm-bulk-add-btn:disabled {
+  background: #374151;
+  color: #9ca3af;
+  cursor: not-allowed;
+}
+
+#dmm-bulk-clear-btn {
+  background: transparent;
+  color: #d1d5db;
+  border: 1px solid #4b5563 !important;
+}
+
+#dmm-bulk-progress {
+  opacity: 0.8;
+  white-space: nowrap;
+}
